@@ -1,0 +1,8 @@
+{
+    "embedding_model": "text-embedding-3-small",
+    "chomradb": "db/chroma_test2",
+    "bm25_index_name": "langchain_bm25",
+    "multi_query_reformulation": true,
+    "num_reformulated_queries": 2,
+    "num_retrieved_docs": 3
+}

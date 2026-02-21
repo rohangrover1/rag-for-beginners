@@ -1,0 +1,12 @@
+.DS_Store
+.python-version
+.venv/*
+docs/*
+db/*
+rag.pdf
+bm25_store/*
+bm25_store_test/*
+chunks_export.json
+images/*
+processed_chunks.json
+rag_results.json
