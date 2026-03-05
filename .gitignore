@@ -10,3 +10,5 @@ chunks_export.json
 images/*
 processed_chunks.json
 rag_results.json
+log.txt
+rag/__pycache__/*

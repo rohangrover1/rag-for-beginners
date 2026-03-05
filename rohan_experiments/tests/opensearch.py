@@ -85,6 +85,6 @@ if __name__ == "__main__":
     sparse_results = bm25_retriever._get_relevant_documents(query)
     print(f"Retrieved {len(sparse_results)} documents for query: '{query}'")
     for i, doc in enumerate(sparse_results):
-        print(f"Document {i}: Metadata {doc.metadata}")
+        print(f"Document {i}: Score {doc.metadata["bm25_score"]}")
         print(f"Text: {doc.page_content}")
 
