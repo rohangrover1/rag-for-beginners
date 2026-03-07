@@ -1,9 +1,8 @@
-import json
 import logging
-from typing import Dict, Iterable, List, Optional
-
+from typing import Any, Dict, Iterable, List
 from opensearchpy import OpenSearch, helpers, ConnectionError, TransportError
 from langchain_core.documents import Document
+from pydantic import BaseModel, Field, field_validator
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -15,9 +14,30 @@ from tenacity import (
 # ------------------------------------------------------------------ #
 #  Module-level logger                                                #
 # ------------------------------------------------------------------ #
-
 logger = logging.getLogger("default_logger")  # Use the same logger configured in main.py
 
+
+# ------------------------------------------------------------------ #
+#  Index Mapping                                                   #
+# ------------------------------------------------------------------ #
+# OpenSearch index mappings — shared across create and ensure operations
+INDEX_MAPPINGS = {
+    "mappings": {
+        "properties": {
+            "doc_id":        {"type": "keyword"},
+            "document_name": {"type": "keyword"},
+            "chunk_index":   {"type": "integer"},
+            "text":          {"type": "text"},       # BM25 field
+            "raw_text":      {"type": "text"},
+            "tables_html":   {"type": "text"},
+            "images_base64": {
+                "type":  "text",
+                "index": False                      # never BM25-indexed
+            },
+            "ai_enhanced":   {"type": "boolean"},
+        }
+    }
+}
 
 # ------------------------------------------------------------------ #
 #  Custom exceptions                                                  #
@@ -59,7 +79,7 @@ class DocumentIDError(KeywordStoreError):
 #  Main class                                                         #
 # ------------------------------------------------------------------ #
 
-class KeywordStoreManager:
+class KeywordStoreManager(BaseModel):
     """
     Manages an OpenSearch BM25 keyword store backed by LangChain Documents
     produced by the PDFPartitioner class.
@@ -82,57 +102,109 @@ class KeywordStoreManager:
         DocumentIDError:              If a document is missing a required ID.
     """
 
-    DEFAULT_HOST = "localhost"
-    DEFAULT_PORT = 9200
-    DEFAULT_MAX_RETRIES = 3
+    # ------------------------------------------------------------------ #
+    #  Pydantic fields                                                    #
+    # ------------------------------------------------------------------ #
 
-    # OpenSearch index mappings — shared across create and ensure operations
-    INDEX_MAPPINGS = {
-        "mappings": {
-            "properties": {
-                "doc_id":        {"type": "keyword"},
-                "document_name": {"type": "keyword"},
-                "chunk_index":   {"type": "integer"},
-                "text":          {"type": "text"},       # BM25 field
-                "raw_text":      {"type": "text"},
-                "tables_html":   {"type": "text"},
-                "images_base64": {
-                    "type":  "text",
-                    "index": False                      # never BM25-indexed
-                },
-                "ai_enhanced":   {"type": "boolean"},
-            }
-        }
-    }
+    index_name: str = Field(
+        ...,
+        min_length=1,
+        description="OpenSearch index to read from and write to.",
+    )
+    host: str = Field(
+        default="localhost",
+        min_length=1,
+        description="OpenSearch hostname.",
+    )
+    port: int = Field(
+        default=9200,
+        ge=1,
+        le=65535,
+        description="OpenSearch port (1–65535).",
+    )
+    max_retries: int = Field(
+        default=3,
+        ge=1,
+        description="Retry attempts for transient OpenSearch errors.",
+    )
+    # Excluded from serialisation; populated by model_post_init.
+    bm25client: Any = Field(default=None, exclude=True)
 
-    def __init__(
-        self,
-        index_name: str,
-        host: str = DEFAULT_HOST,
-        port: int = DEFAULT_PORT,
-        max_retries: int = DEFAULT_MAX_RETRIES,
-    ):
-        """
-        Args:
-            index_name:   OpenSearch index to read from and write to.
-            host:         OpenSearch hostname.
-            port:         OpenSearch port.
-            max_retries:  Retry attempts for transient OpenSearch errors.
+    # ------------------------------------------------------------------ #
+    #  Field validators                                                   #
+    # ------------------------------------------------------------------ #
+
+    @field_validator("index_name")
+    @classmethod
+    def _validate_index_name(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("index_name must not be blank or whitespace.")
+        return v
+
+    @field_validator("host")
+    @classmethod
+    def _validate_host(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("host must not be blank or whitespace.")
+        return v
+
+    # ------------------------------------------------------------------ #
+    #  Post-init: open the OpenSearch client                              #
+    # ------------------------------------------------------------------ #
+
+    def model_post_init(self, __context: Any) -> None:
+        """Open and ping-verify the BM25 client after Pydantic validation.
 
         Raises:
-            ValueError: If any argument fails validation.
+            KeywordStoreConnectionError: If the client cannot connect.
         """
-        self._validate_init_args(index_name, host, port, max_retries)
-
-        self.index_name = index_name
-        self.host = host
-        self.port = port
-        self.max_retries = max_retries
-
+        # BaseModel fields are immutable by default; use object.__setattr__
+        # to set the non-Field runtime attribute without triggering Pydantic.
+        object.__setattr__(self, "bm25client", self._open_client())
         logger.debug(
             "KeywordStoreManager initialised | index=%s host=%s:%d max_retries=%d",
-            index_name, host, port, max_retries,
+            self.index_name, self.host, self.port, self.max_retries,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Client                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _open_client(self) -> OpenSearch:
+        """Create, ping-verify, and return a persistent OpenSearch client.
+
+        Called once during __init__ to populate self.bm25client.
+
+        Raises:
+            KeywordStoreConnectionError: If the client cannot be created or
+                                         does not respond to a ping.
+        """
+        try:
+            client = OpenSearch(
+                hosts=[{"host": self.host, "port": self.port}],
+                http_compress=True,
+            )
+            if not client.ping():
+                logger.error(
+                    "OpenSearch at %s:%d did not respond to ping.",
+                    self.host, self.port,
+                )
+                raise KeywordStoreConnectionError(
+                    f"OpenSearch at {self.host}:{self.port} did not respond to ping."
+                )
+        except KeywordStoreConnectionError:
+            raise
+        except Exception as e:
+            logger.error(
+                "Failed to connect to OpenSearch at %s:%d: %s",
+                self.host, self.port, e,
+            )
+            raise KeywordStoreConnectionError(
+                f"Failed to connect to OpenSearch at {self.host}:{self.port}: {e}"
+            ) from e
+
+        logger.debug("OpenSearch client connected | %s:%d", self.host, self.port)
+        return client
 
     # ------------------------------------------------------------------ #
     #  Entry point                                                         #
@@ -170,16 +242,15 @@ class KeywordStoreManager:
             document_name, len(chunks),
         )
 
-        client = self._get_client()
-        self._ensure_index(client)
+        self._ensure_index()
 
-        if self._document_exists(client, document_name):
+        if self._document_exists(document_name):
             logger.info(
                 "Document '%s' already indexed — skipping ingest", document_name
             )
             return True
 
-        result = self._reindex_document(client, document_name, chunks)
+        result = self._reindex_document(document_name, chunks)
 
         logger.info(
             "Keyword store update complete | document=%s deleted=%d indexed=%d",
@@ -190,61 +261,28 @@ class KeywordStoreManager:
         return True
 
     # ------------------------------------------------------------------ #
-    #  Client                                                             #
-    # ------------------------------------------------------------------ #
-
-    def _get_client(self) -> OpenSearch:
-        """Create and return an OpenSearch client.
-
-        Raises:
-            KeywordStoreConnectionError: If the client cannot be created.
-        """
-        try:
-            client = OpenSearch(
-                hosts=[{"host": self.host, "port": self.port}],
-                http_compress=True,
-            )
-            # Ping to verify the connection is live
-            if not client.ping():
-                logger.error(f"OpenSearch at {self.host}:{self.port} did not respond to ping.")    
-                raise KeywordStoreConnectionError(
-                    f"OpenSearch at {self.host}:{self.port} did not respond to ping."
-                )
-        except KeywordStoreConnectionError:
-            logger.error(f"OpenSearch at {self.host}:{self.port} is unreachable.")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to connect to OpenSearch at {self.host}:{self.port}: {e}")   
-            raise KeywordStoreConnectionError(
-                f"Failed to connect to OpenSearch at {self.host}:{self.port}: {e}"
-            ) from e
-
-        logger.debug("OpenSearch client connected | %s:%d", self.host, self.port)
-        return client
-
-    # ------------------------------------------------------------------ #
     #  Index management                                                   #
     # ------------------------------------------------------------------ #
 
-    def _ensure_index(self, client: OpenSearch) -> None:
+    def _ensure_index(self) -> None:
         """Create the index with correct mappings if it does not exist.
 
         Raises:
             KeywordStoreIndexError: If index creation fails.
         """
         try:
-            if client.indices.exists(index=self.index_name):
+            if self.bm25client.indices.exists(index=self.index_name):
                 logger.debug("Index '%s' already exists", self.index_name)
                 return
 
-            client.indices.create(
+            self.bm25client.indices.create(
                 index=self.index_name,
                 body=self.INDEX_MAPPINGS,
             )
             logger.info("Created index '%s'", self.index_name)
 
         except Exception as e:
-            logger.error(f"Failed to create index '{self.index_name}': {e}")
+            logger.error("Failed to create index '%s': %s", self.index_name, e)
             raise KeywordStoreIndexError(
                 f"Failed to create index '{self.index_name}': {e}"
             ) from e
@@ -255,7 +293,6 @@ class KeywordStoreManager:
 
     def _reindex_document(
         self,
-        client: OpenSearch,
         document_name: str,
         chunks: List[Document],
     ) -> Dict:
@@ -268,26 +305,32 @@ class KeywordStoreManager:
 
         try:
             deleted = self._delete_document_chunks(
-                client, document_name, refresh=True
+                document_name, refresh=True
             )
             logger.info(
                 "Deleted %d existing chunks for document '%s'",
                 deleted, document_name,
             )
         except KeywordStoreDeleteError as e:
-            logger.error(f"Reindex aborted during delete phase for '{document_name}': {e}")
+            logger.error(
+                "Reindex aborted during delete phase for '%s': %s",
+                document_name, e,
+            )
             raise KeywordStoreReindexError(
                 f"Reindex aborted during delete phase for '{document_name}': {e}"
             ) from e
 
         try:
-            indexed = self._bulk_upsert_documents(client, chunks, refresh=True)
+            indexed = self._bulk_upsert_documents(chunks, refresh=True)
             logger.info(
                 "Upserted %d chunks for document '%s'", indexed, document_name
             )
         except KeywordStoreIngestError as e:
-            logger.error(f"Reindex failed during upsert phase for '{document_name}': {e}")
-            logger.error( f"Document was deleted but not re-indexed: {e}")
+            logger.error(
+                "Reindex failed during upsert phase for '%s': %s",
+                document_name, e,
+            )
+            logger.error("Document was deleted but not re-indexed: %s", e)
             raise KeywordStoreReindexError(
                 f"Reindex failed during upsert phase for '{document_name}'. "
                 f"Document was deleted but not re-indexed: {e}"
@@ -305,7 +348,6 @@ class KeywordStoreManager:
 
     def _bulk_upsert_documents(
         self,
-        client: OpenSearch,
         documents: Iterable[Document],
         refresh: bool = False,
     ) -> int:
@@ -317,7 +359,7 @@ class KeywordStoreManager:
             Number of successfully indexed documents.
 
         Raises:
-            DocumentIDError:      If any document is missing an ID.
+            DocumentIDError:         If any document is missing an ID.
             KeywordStoreIngestError: If all retry attempts are exhausted.
         """
         # Materialise so we can validate IDs before hitting the network
@@ -346,13 +388,13 @@ class KeywordStoreManager:
                             "raw_text":      doc.metadata["raw_text"],
                             "tables_html":   doc.metadata["tables_html"],
                             "images_base64": doc.metadata["images_base64"],
-                            "ai_enhanced":  doc.metadata["ai_enhanced"],
+                            "ai_enhanced":   doc.metadata["ai_enhanced"],
                         },
                         "doc_as_upsert": True,
                     }
 
             success, failed = helpers.bulk(
-                client,
+                self.bm25client,
                 actions(),
                 refresh=refresh,
                 raise_on_error=False,
@@ -368,7 +410,10 @@ class KeywordStoreManager:
         try:
             return _call()
         except Exception as e:
-            logger.error(f"Bulk upsert into '{self.index_name}' failed after {self.max_retries} attempts: {e}")
+            logger.error(
+                "Bulk upsert into '%s' failed after %d attempts: %s",
+                self.index_name, self.max_retries, e,
+            )
             raise KeywordStoreIngestError(
                 f"Bulk upsert into '{self.index_name}' failed after "
                 f"{self.max_retries} attempts: {e}"
@@ -376,7 +421,6 @@ class KeywordStoreManager:
 
     def _delete_document_chunks(
         self,
-        client: OpenSearch,
         document_name: str,
         refresh: bool = True,
     ) -> int:
@@ -390,6 +434,22 @@ class KeywordStoreManager:
         Raises:
             KeywordStoreDeleteError: If all retry attempts are exhausted.
         """
+        
+        document_exists = self._document_exists(document_name)
+        if not document_exists:
+            logger.info(
+                "No existing chunks found for document '%s' in index '%s'. "
+                "Skipping delete-by-query.",
+                document_name, self.index_name,
+            )
+            return 0
+        
+        num_docs = self.number_of_documents()
+        logger.info(
+            "Found existing chunks for document '%s' in index '%s with %d documents'. "
+            "Proceeding with delete-by-query.",
+            document_name, self.index_name, num_docs)
+
         @retry(
             retry=retry_if_exception_type((ConnectionError, TransportError)),
             stop=stop_after_attempt(self.max_retries),
@@ -398,18 +458,23 @@ class KeywordStoreManager:
             reraise=False,
         )
         def _call() -> int:
-            response = client.delete_by_query(
+            response = self.bm25client.delete_by_query(
                 index=self.index_name,
                 body={"query": {"term": {"document_name": document_name}}},
                 conflicts="proceed",
                 refresh=refresh,
             )
+            num_docs = self.number_of_documents()
+            logger.info("number of documents in index '%s' after delete_by_query: %d", self.index_name, num_docs)
             return response["deleted"]
 
         try:
             return _call()
         except Exception as e:
-            logger.error(f"delete_by_query for document '{document_name}' in index '{self.index_name}' failed after {self.max_retries} attempts: {e}")
+            logger.error(
+                "delete_by_query for document '%s' in index '%s' failed after %d attempts: %s",
+                document_name, self.index_name, self.max_retries, e,
+            )
             raise KeywordStoreDeleteError(
                 f"delete_by_query for document '{document_name}' in index "
                 f"'{self.index_name}' failed after {self.max_retries} attempts: {e}"
@@ -419,14 +484,14 @@ class KeywordStoreManager:
     #  Read operations                                                    #
     # ------------------------------------------------------------------ #
 
-    def _document_exists(self, client: OpenSearch, document_name: str) -> bool:
+    def _document_exists(self, document_name: str) -> bool:
         """Return True if any chunk for the document is already indexed.
 
         Raises:
             KeywordStoreQueryError: If the search query fails.
         """
         try:
-            response = client.search(
+            response = self.bm25client.search(
                 index=self.index_name,
                 body={
                     "query": {"term": {"document_name": document_name}},
@@ -435,7 +500,9 @@ class KeywordStoreManager:
             )
             exists = response["hits"]["total"]["value"] > 0
         except Exception as e:
-            logger.error(f"Existence check for document '{document_name}' failed: {e}")
+            logger.error(
+                "Existence check for document '%s' failed: %s", document_name, e
+            )
             raise KeywordStoreQueryError(
                 f"Existence check for document '{document_name}' failed: {e}"
             ) from e
@@ -450,18 +517,17 @@ class KeywordStoreManager:
         """Return the total number of documents indexed in the store.
 
         Raises:
-            KeywordStoreConnectionError: If OpenSearch is unreachable.
-            KeywordStoreQueryError:      If the count query fails.
+            KeywordStoreQueryError: If the count query fails.
         """
-        client = self._get_client()
-
         try:
-            if not client.indices.exists(index=self.index_name):
+            if not self.bm25client.indices.exists(index=self.index_name):
                 logger.warning("Index '%s' does not exist", self.index_name)
                 return 0
-            response = client.count(index=self.index_name)
+            response = self.bm25client.count(index=self.index_name)
         except Exception as e:
-            logger.error(f"Count query on index '{self.index_name}' failed: {e}")
+            logger.error(
+                "Count query on index '%s' failed: %s", self.index_name, e
+            )
             raise KeywordStoreQueryError(
                 f"Count query on index '{self.index_name}' failed: {e}"
             ) from e
@@ -477,13 +543,10 @@ class KeywordStoreManager:
         """Return all doc_ids stored in the index.
 
         Raises:
-            KeywordStoreConnectionError: If OpenSearch is unreachable.
-            KeywordStoreQueryError:      If the scroll query fails.
+            KeywordStoreQueryError: If the scroll query fails.
         """
-        client = self._get_client()
-
         try:
-            response = client.search(
+            response = self.bm25client.search(
                 index=self.index_name,
                 body={"query": {"match_all": {}}, "_source": ["doc_id"]},
                 scroll="2m",
@@ -493,7 +556,7 @@ class KeywordStoreManager:
             scroll_id = response.get("_scroll_id")
 
             while scroll_id:
-                page = client.scroll(scroll_id=scroll_id, scroll="2m")
+                page = self.bm25client.scroll(scroll_id=scroll_id, scroll="2m")
                 hits = page["hits"]["hits"]
                 if not hits:
                     break
@@ -501,12 +564,17 @@ class KeywordStoreManager:
                 scroll_id = page.get("_scroll_id")
 
         except Exception as e:
-            logger.error(f"Failed to retrieve all document IDs from index '{self.index_name}': {e}")
+            logger.error(
+                "Failed to retrieve all document IDs from index '%s': %s",
+                self.index_name, e,
+            )
             raise KeywordStoreQueryError(
                 f"Failed to retrieve all document IDs from '{self.index_name}': {e}"
             ) from e
 
-        logger.info("Retrieved %d document IDs from index '%s'", len(ids), self.index_name)
+        logger.info(
+            "Retrieved %d document IDs from index '%s'", len(ids), self.index_name
+        )
         return ids
 
     # ------------------------------------------------------------------ #
@@ -522,7 +590,11 @@ class KeywordStoreManager:
         """
         for i, doc in enumerate(documents):
             if not hasattr(doc, "id") or doc.id is None:
-                logger.error(f"Document at index {i} is missing 'id'. doc.id is required for OpenSearch upserts.")
+                logger.error(
+                    "Document at index %d is missing 'id'. "
+                    "doc.id is required for OpenSearch upserts.",
+                    i,
+                )
                 raise DocumentIDError(
                     f"Document at index {i} is missing 'id'. "
                     "doc.id is required for OpenSearch upserts."
@@ -531,38 +603,6 @@ class KeywordStoreManager:
     # ------------------------------------------------------------------ #
     #  Validation                                                         #
     # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _validate_init_args(
-        index_name: str,
-        host: str,
-        port: int,
-        max_retries: int,
-    ) -> None:
-        """Validate constructor arguments.
-
-        Raises:
-            ValueError: On any invalid argument.
-        """
-        if not index_name or not index_name.strip():
-            logger.error("index_name must be a non-empty string.")
-            raise ValueError("index_name must be a non-empty string.")
-
-        if not host or not host.strip():
-            logger.error("host must be a non-empty string.")   
-            raise ValueError("host must be a non-empty string.")
-
-        if not isinstance(port, int) or not (1 <= port <= 65535):
-            logger.error(f"port must be an integer between 1 and 65535, got {port}.")
-            raise ValueError(
-                f"port must be an integer between 1 and 65535, got {port}."
-            )
-
-        if max_retries < 1:
-            logger.error(f"max_retries must be >= 1, got {max_retries}.")
-            raise ValueError(
-                f"max_retries must be >= 1, got {max_retries}."
-            )
 
     @staticmethod
     def _validate_document_name(document_name: str) -> None:
@@ -587,11 +627,13 @@ class KeywordStoreManager:
             raise ValueError("chunks must not be None.")
 
         if not isinstance(chunks, list):
-            logger.error(f"chunks must be a list, got {type(chunks).__name__}.")
+            logger.error(
+                "chunks must be a list, got %s.", type(chunks).__name__
+            )
             raise ValueError(
                 f"chunks must be a list, got {type(chunks).__name__}."
             )
 
         if len(chunks) == 0:
-            logger.error("chunks must not be empty.")  
+            logger.error("chunks must not be empty.")
             raise ValueError("chunks must not be empty.")

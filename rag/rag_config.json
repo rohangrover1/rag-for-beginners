@@ -1,5 +1,5 @@
 {
-    "delete_all_documeents_before_ingest": true,
+    "delete_documents_before_ingest": true,
     "ai_summarization_model": "gpt-4o",
     "embedding_model": "text-embedding-3-small",
     "chomradb": "db/chroma_test3",
