@@ -1,6 +1,8 @@
 {
-    "delete_documents_before_ingest": true,
+    "delete_documents_before_ingest": false,
     "ai_summarization_model": "gpt-4o",
+    "ai_multi_query_reformulation_model": "gpt-4o",
+    "reranker_cohere_model": "rerank-english-v3.0",
     "embedding_model": "text-embedding-3-small",
     "chomradb": "db/chroma_test3",
     "bm25_index_name": "langchain_bm25",

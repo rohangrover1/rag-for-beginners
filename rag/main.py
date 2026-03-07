@@ -83,6 +83,8 @@ if __name__ == "__main__":
         config = read_config("rag/rag_config.json")
         delete_documents_before_ingest = config.get("delete_documents_before_ingest", False)  # default to False if not specified
         ai_summarization_model = config.get("ai_summarization_model", "gpt-4o")  # default to gpt-4o if not specified
+        ai_multi_query_reformulation_model = config.get("ai_multi_query_reformulation_model", "gpt-4o")  # default to gpt-4o if not specified
+        reranker_model_name = config.get("reranker_cohere_model", "rerank-english-v3.0")  # default to rerank-english-v3.0 if not specified
         persist_directory = config.get("chomradb", "db/chroma_db")  # default to db/chroma_db if not specified
         bm25_index_name = config.get("bm25_index_name", "langchain_bm25")  # default to langchain_bm25 if not specified
         embedding_model_name = config.get("embedding_model", "text-embedding-3-small")  # default to text-embedding-3-small if not specified
@@ -108,37 +110,43 @@ if __name__ == "__main__":
         # if docs:
         #     PDFPartitioner.export_chunks_to_json(docs, "processed_chunks.json") # dump the processed documents to a json file for inspection
 
-        docs = load_docs_from_json("processed_chunks.json")  # Load processed documents from JSON file
-        logger.info(f"Loaded {len(docs)} documents from JSON file.")
+        # docs = load_docs_from_json("processed_chunks.json")  # Load processed documents from JSON file
+        # logger.info(f"Loaded {len(docs)} documents from JSON file.")
 
         # # store the processed documents in the vector store and keyword storea
-        if docs:
+        # if docs:
         #     # update the vector store
-        #     # vector_store_manager = VectorStoreManager(persist_directory=persist_directory, embedding_model=embedding_model_name)
-        #     # if delete_documents_before_ingest:
-        #     #     vector_store_manager.safe_bulk_delete_all_vectors()  # Clear existing collection before ingesting new documents
-        #     # vector_store_manager.update_vector_store(documents=docs, document_name=document_name)
+        #     vector_store_manager = VectorStoreManager(persist_directory=persist_directory, embedding_model=embedding_model_name)
+        #     if delete_documents_before_ingest:
+        #         vector_store_manager.safe_bulk_delete_all_vectors()  # Clear existing collection before ingesting new documents
+        #     vector_store_manager.update_vector_store(documents=docs, document_name=document_name)
 
-            # update the keyword store
-            keyword_store_manager = KeywordStoreManager(index_name=bm25_index_name)
-            if delete_documents_before_ingest:
-                keyword_store_manager._delete_document_chunks(document_name=document_name)  # Clear existing index before ingesting new documents
-            keyword_store_manager.update_keyword_store(document_name=document_name, chunks=docs)
+            # # update the keyword store
+            # keyword_store_manager = KeywordStoreManager(index_name=bm25_index_name)
+            # if delete_documents_before_ingest:
+            #     keyword_store_manager._delete_document_chunks(document_name=document_name)  # Clear existing index before ingesting new documents
+            # keyword_store_manager.update_keyword_store(document_name=document_name, chunks=docs)
 
+        # retrieve documents for given query and print results
+        query = "What is the Certificate of Business Excellence"
 
-
-        # # retrieve documents for given query and print results
-        # query = "What is the Certificate of Business Excellence"
-
-        # results = HybridRetriever(query, persist_directory, embedding_model_name, bm25_index_name, 
-        #                           num_retrieved_docs, num_reformulated_queries, multi_query_reformulation)
-        # # bm25_retriever = BM25Retriever(host="localhost", port=9200, index_name=bm25_index_name, k=num_retrieved_docs)
-        # # sparse_results = bm25_retriever.invoke(query)
-        # print(f"Retrieved {len(results)} documents for query: '{query}'")
-        # for i, doc in enumerate(results):
-        #     print(f"Document {i+1}:")
-        #     print(f"Text: {doc.page_content}")
-            
+        retriever = HybridRetriever(
+            persist_directory=persist_directory,
+            embedding_model_name=embedding_model_name,
+            llm_model_name=ai_multi_query_reformulation_model,
+            reranker_model_name=reranker_model_name,
+            bm25_index_name=bm25_index_name,
+            bm25_host="localhost",
+            num_retrieved_docs=num_retrieved_docs,
+            num_reformulated_queries=num_reformulated_queries,
+            multi_query_reformulation=multi_query_reformulation
+        )
+        results = retriever.invoke(query)
+        logger.info(f"Retrieved {len(results)} documents for query: '{query}'")
+        for i, doc in enumerate(results):
+            logger.info(f"Document {i+1}:")
+            logger.info(f"Text: {doc.page_content[:200]}...")  # Print first 200 characters of page content for brevity
+            logger.info(f"Metadata: {doc.metadata['raw_text'][:200]}...")  # Print first 200 characters of raw text for brevity
             
         
     except Exception as e:

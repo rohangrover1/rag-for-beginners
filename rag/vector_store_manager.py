@@ -1,10 +1,9 @@
 import logging
-import os
-from typing import List, Tuple
-
+from typing import Any, List, Tuple
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
+from pydantic import BaseModel, Field, field_validator
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -26,14 +25,6 @@ logger = logging.getLogger("default_logger")
 
 class VectorStoreError(Exception):
     """Base exception for all VectorStore errors."""
-
-
-class VectorStoreLoadError(VectorStoreError):
-    """Raised when an existing vector store cannot be loaded."""
-
-
-class VectorStoreCreateError(VectorStoreError):
-    """Raised when a new vector store cannot be created."""
 
 
 class VectorStoreUpdateError(VectorStoreError):
@@ -60,7 +51,7 @@ class EmbeddingError(VectorStoreError):
 #  Main class                                                         #
 # ------------------------------------------------------------------ #
 
-class VectorStoreManager:
+class VectorStoreManager(BaseModel):
     """
     Manages a persistent ChromaDB vector store backed by OpenAI embeddings.
 
@@ -75,9 +66,7 @@ class VectorStoreManager:
         count = manager.number_of_documents()
 
     Raises:
-        ValueError:            If constructor or method arguments are invalid.
-        VectorStoreLoadError:  If an existing store cannot be loaded.
-        VectorStoreCreateError: If a new store cannot be created.
+        ValueError:             If constructor or method arguments are invalid.
         VectorStoreUpdateError: If adding documents fails.
         VectorStoreDeleteError: If a bulk delete operation fails.
         VectorStoreQueryError:  If a similarity search fails.
@@ -85,62 +74,126 @@ class VectorStoreManager:
         EmbeddingError:         If the embedding API fails after all retries.
     """
 
-    DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-    DEFAULT_SIMILARITY_THRESHOLD = 0.98
-    DEFAULT_DUPLICATE_CHECK_K = 3
-    DEFAULT_DELETE_BATCH_SIZE = 1000
+    # ------------------------------------------------------------------ #
+    #  Pydantic fields                                                    #
+    # ------------------------------------------------------------------ #
 
-    def __init__(
-        self,
-        persist_directory: str,
-        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-        similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
-        duplicate_check_k: int = DEFAULT_DUPLICATE_CHECK_K,
-        embedding_max_retries: int = 3,
-    ):
+    persist_directory: str = Field(
+        ...,
+        min_length=1,
+        description="Path where ChromaDB persists its data.",
+    )
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        min_length=1,
+        description="OpenAI embedding model name.",
+    )
+    similarity_threshold: float = Field(
+        default=0.98,
+        gt=0.0,
+        le=1.0,
+        description="Cosine similarity above which a chunk is considered a duplicate (0.0–1.0).",
+    )
+    duplicate_check_k: int = Field(
+        default=3,
+        ge=1,
+        description="Number of neighbours to inspect during semantic duplicate checking.",
+    )
+    embedding_max_retries: int = Field(
+        default=3,
+        ge=1,
+        description="Retry attempts for embedding API calls.",
+    )
+    delete_batch_size: int = Field(
+        default=1000,
+        ge=1,
+        description="Number of vectors to delete per batch in bulk deletes.",
+    )
+    # Excluded from serialisation; populated by model_post_init.
+    embedding_function: Any = Field(default=None, exclude=True)
+    chroma_client: Any = Field(default=None, exclude=True)
+
+    # ------------------------------------------------------------------ #
+    #  Field validators                                                   #
+    # ------------------------------------------------------------------ #
+
+    @field_validator("persist_directory")
+    @classmethod
+    def _validate_persist_directory(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("persist_directory must not be blank or whitespace.")
+        return v
+
+    @field_validator("embedding_model")
+    @classmethod
+    def _validate_embedding_model(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("embedding_model must not be blank or whitespace.")
+        return v
+
+    # ------------------------------------------------------------------ #
+    #  Post-init: build embedding function and Chroma client              #
+    # ------------------------------------------------------------------ #
+
+    def model_post_init(self, __context: Any) -> None:
+        """Instantiate the embedding function and Chroma client after Pydantic validation.
+
+        Uses object.__setattr__ because BaseModel fields are immutable by default.
         """
-        Args:
-            persist_directory:    Path where ChromaDB persists its data.
-            embedding_model:      OpenAI embedding model name.
-            similarity_threshold: Cosine similarity above which a chunk is
-                                  considered a duplicate (0.0–1.0).
-            duplicate_check_k:    Number of neighbours to inspect during
-                                  semantic duplicate checking.
-            embedding_max_retries: Retry attempts for embedding API calls.
-
-        Raises:
-            ValueError: If any argument fails validation.
-        """
-        self._validate_init_args(
-            persist_directory,
-            embedding_model,
-            similarity_threshold,
-            duplicate_check_k,
-            embedding_max_retries,
-
-        )
-
-        self.persist_directory = persist_directory
-        self.similarity_threshold = similarity_threshold
-        self.duplicate_check_k = duplicate_check_k
-        self.embedding_max_retries = embedding_max_retries
-        self._embedding_model_name = embedding_model
-        self._embedding_function = OpenAIEmbeddings(model=self._embedding_model_name)
+        embedding_fn = OpenAIEmbeddings(model=self.embedding_model)
+        object.__setattr__(self, "embedding_function", embedding_fn)
+        object.__setattr__(self, "chroma_client", self._open_client())
 
         logger.debug(
             "VectorStoreManager initialised | persist_directory=%s "
             "embedding_model=%s similarity_threshold=%.2f",
-            persist_directory,
-            embedding_model,
-            similarity_threshold,
+            self.persist_directory,
+            self.embedding_model,
+            self.similarity_threshold,
         )
 
     # ------------------------------------------------------------------ #
-    #  Entry point                                                         #
+    #  Client                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _open_client(self) -> Chroma:
+        """Create and return a persistent Chroma client.
+
+        Called once during model_post_init to populate self.chroma_client.
+        If the store does not yet exist on disk, a client is still returned;
+        the collection will be created on the first write.
+
+        Raises:
+            VectorStoreLoadError: If Chroma raises during client initialisation.
+        """
+        try:
+            client = Chroma(
+                persist_directory=self.persist_directory,
+                embedding_function=self.embedding_function,
+                collection_metadata={"hnsw:space": "cosine"},
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to initialise Chroma client at '%s': %s",
+                self.persist_directory, e,
+            )
+            raise VectorStoreLoadError(
+                f"Failed to initialise Chroma client at '{self.persist_directory}': {e}"
+            ) from e
+
+        logger.debug(
+            "Chroma client initialised | persist_directory=%s",
+            self.persist_directory,
+        )
+        return client
+
+    # ------------------------------------------------------------------ #
+    #  Entry point                                                        #
     # ------------------------------------------------------------------ #
 
     def update_vector_store(
-        self, documents: List[Document], document_name: str) -> bool:
+        self, documents: List[Document], document_name: str
+    ) -> bool:
         """
         Create or update the ChromaDB vector store with new documents.
 
@@ -158,27 +211,39 @@ class VectorStoreManager:
         Raises:
             ValueError:             If arguments are invalid.
             DocumentIDError:        If any document is missing an ID.
-            VectorStoreLoadError:   If the existing store cannot be loaded.
-            VectorStoreCreateError: If a new store cannot be created.
             VectorStoreUpdateError: If upserting documents fails.
             EmbeddingError:         If the embedding API fails after all retries.
         """
         self._validate_documents(documents)
         self._validate_document_name(document_name)
 
+        num_documents_in_store = self.number_of_documents()
+        logger.info(
+            "Preparing to update vector store at '%s' with %d documents "
+            "for document_name='%s'. Current store size: %d documents.",
+            self.persist_directory,
+            len(documents),
+            document_name,
+            num_documents_in_store,
+        )
         logger.info(
             "Starting vector store update | document=%s documents=%d",
             document_name,
             len(documents),
         )
 
-        if os.path.exists(self.persist_directory):
-            self._update_existing_store(documents, document_name)
-        else:
-            self._create_new_store(documents)
+        if self._document_exists(document_name):
+            logger.info(
+                "Document '%s' already indexed — skipping ingest", document_name
+            )
+            return True
 
+        self._upsert_documents(documents, document_name)
+        
+        num_documents_in_store = self.number_of_documents()
         logger.info(
-            "Vector store update complete | document=%s", document_name
+            "Vector store update complete and now contains %d documents after update.",
+            num_documents_in_store
         )
         return True
 
@@ -186,56 +251,21 @@ class VectorStoreManager:
     #  Store operations (private)                                         #
     # ------------------------------------------------------------------ #
 
-    def _create_new_store(self, documents: List[Document]) -> None:
-        """Create a brand-new ChromaDB store from documents.
-
-        Raises:
-            VectorStoreCreateError: If Chroma raises during creation.
-            EmbeddingError:         If the embedding API fails after all retries.
-        """
-        logger.info(
-            "No existing store found — creating new store at: %s",
-            self.persist_directory,
-        )
-        ids = self._extract_chunk_ids(documents)
-
-        try:
-            self._embed_and_create(documents, ids)
-        except EmbeddingError:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to create vector store at '{self.persist_directory}': {e}"   )   
-            raise VectorStoreCreateError(
-                f"Failed to create vector store at '{self.persist_directory}': {e}"
-            ) from e
-
-        logger.info(
-            "Vector store created and saved to: %s", self.persist_directory
-        )
-
-    def _update_existing_store(
+    def _upsert_documents(
         self, documents: List[Document], document_name: str
     ) -> None:
-        """Load an existing store and upsert new, non-duplicate documents.
+        """Deduplicate and upsert documents into the Chroma client.
+
+        Works identically whether the collection is empty (new store) or
+        already populated — Chroma handles both cases transparently via
+        the shared chroma_client initialised in model_post_init.
 
         Raises:
-            VectorStoreLoadError:   If the store cannot be loaded.
             VectorStoreUpdateError: If the upsert fails.
             EmbeddingError:         If the embedding API fails after all retries.
         """
-        logger.info(
-            "Existing store found at %s — loading", self.persist_directory
-        )
-        vectorstore = self._load_store()
-
-        if self._document_exists(vectorstore, document_name):
-            logger.info(
-                "Document '%s' already indexed — skipping ingest", document_name
-            )
-            return
-
         non_duplicate_docs = self._filter_semantic_duplicates(
-            vectorstore, documents, document_name
+            documents, document_name
         )
 
         if not non_duplicate_docs:
@@ -248,83 +278,29 @@ class VectorStoreManager:
         ids = self._extract_chunk_ids(non_duplicate_docs)
 
         try:
-            self._embed_and_add(vectorstore, non_duplicate_docs, ids)
+            self._embed_and_upsert(non_duplicate_docs, ids)
         except EmbeddingError:
             raise
         except Exception as e:
-            logger.error(f"Failed to upsert documents into store at '{self.persist_directory}': {e}")
+            logger.error(
+                "Failed to upsert documents into store at '%s': %s",
+                self.persist_directory, e,
+            )
             raise VectorStoreUpdateError(
                 f"Failed to upsert documents into store at "
                 f"'{self.persist_directory}': {e}"
             ) from e
 
-        logger.info(
-            "Upserted %d documents into existing store", len(non_duplicate_docs)
-        )
-
-    def _load_store(self) -> Chroma:
-        """Load the existing ChromaDB vector store from disk.
-
-        Raises:
-            VectorStoreLoadError: If Chroma raises during loading.
-        """
-        try:
-            vectorstore = Chroma(
-                persist_directory=self.persist_directory,
-                embedding_function=self._embedding_function,
-                collection_metadata={"hnsw:space": "cosine"},
-            )
-        except Exception as e:
-            logger.error(f"Failed to load vector store from '{self.persist_directory}': {e}") 
-            raise VectorStoreLoadError(
-                f"Failed to load vector store from '{self.persist_directory}': {e}"
-            ) from e
-
-        count = vectorstore._collection.count()
-        logger.info("Vector store loaded — %d documents in collection", count)
-        return vectorstore
+        logger.info("Upserted %d documents into store", len(non_duplicate_docs))
 
     # ------------------------------------------------------------------ #
     #  Embedding API calls with retry                                     #
     # ------------------------------------------------------------------ #
 
-    def _embed_and_create(
+    def _embed_and_upsert(
         self, documents: List[Document], ids: List[str]
-    ) -> Chroma:
-        """Call Chroma.from_documents with retry on transient embedding errors.
-
-        Raises:
-            EmbeddingError: If all retry attempts are exhausted.
-        """
-        @retry(
-            retry=retry_if_exception_type(Exception),
-            stop=stop_after_attempt(self.embedding_max_retries),
-            wait=wait_exponential(multiplier=1, min=2, max=30),
-            before_sleep=before_sleep_log(logger, logging.WARNING),
-            reraise=False,
-        )
-        def _call() -> Chroma:
-            return Chroma.from_documents(
-                documents=documents,
-                ids=ids,
-                embedding=self._embedding_function,
-                persist_directory=self.persist_directory,
-                collection_metadata={"hnsw:space": "cosine"},
-            )
-
-        try:
-            return _call()
-        except Exception as e:
-            logger.error(f"Embedding API failed after {self.embedding_max_retries} attempts during store creation: {e}")
-            raise EmbeddingError(
-                f"Embedding API failed after {self.embedding_max_retries} "
-                f"attempts during store creation: {e}"
-            ) from e
-
-    def _embed_and_add(
-        self, vectorstore: Chroma, documents: List[Document], ids: List[str]
     ) -> None:
-        """Call vectorstore.add_documents with retry on transient embedding errors.
+        """Call chroma_client.add_documents with retry on transient embedding errors.
 
         Raises:
             EmbeddingError: If all retry attempts are exhausted.
@@ -337,15 +313,18 @@ class VectorStoreManager:
             reraise=False,
         )
         def _call() -> None:
-            vectorstore.add_documents(documents=documents, ids=ids)
+            self.chroma_client.add_documents(documents=documents, ids=ids)
 
         try:
             _call()
         except Exception as e:
-            logger.error(f"Embedding API failed after {self.embedding_max_retries} attempts during store update: {e}")
+            logger.error(
+                "Embedding API failed after %d attempts during upsert: %s",
+                self.embedding_max_retries, e,
+            )
             raise EmbeddingError(
                 f"Embedding API failed after {self.embedding_max_retries} "
-                f"attempts during store update: {e}"
+                f"attempts during upsert: {e}"
             ) from e
 
     # ------------------------------------------------------------------ #
@@ -354,7 +333,6 @@ class VectorStoreManager:
 
     def _filter_semantic_duplicates(
         self,
-        vectorstore: Chroma,
         documents: List[Document],
         document_name: str,
     ) -> List[Document]:
@@ -364,7 +342,7 @@ class VectorStoreManager:
         for doc in documents:
             try:
                 is_duplicate, similarity = self._is_semantic_duplicate(
-                    vectorstore, document_name, doc.page_content
+                    document_name, doc.page_content
                 )
             except VectorStoreQueryError as e:
                 logger.warning(
@@ -399,7 +377,6 @@ class VectorStoreManager:
 
     def _is_semantic_duplicate(
         self,
-        vectorstore: Chroma,
         doc_name: str,
         text: str,
     ) -> Tuple[bool, float]:
@@ -412,13 +389,15 @@ class VectorStoreManager:
             VectorStoreQueryError: If the similarity search fails.
         """
         try:
-            results = vectorstore.similarity_search_with_score(
+            results = self.chroma_client.similarity_search_with_score(
                 text,
                 k=self.duplicate_check_k,
                 filter={"document_name": doc_name},
             )
         except Exception as e:
-            logger.error(f"Similarity search failed for document '{doc_name}': {e}")
+            logger.error(
+                "Similarity search failed for document '%s': %s", doc_name, e
+            )
             raise VectorStoreQueryError(
                 f"Similarity search failed for document '{doc_name}': {e}"
             ) from e
@@ -441,10 +420,19 @@ class VectorStoreManager:
         """Return the total number of vectors in the store.
 
         Raises:
-            VectorStoreLoadError: If the store cannot be loaded.
+            VectorStoreQueryError: If the count query fails.
         """
-        vectorstore = self._load_store()
-        count = vectorstore._collection.count()
+        try:
+            count = self.chroma_client._collection.count()
+        except Exception as e:
+            logger.error(
+                "Count query on store at '%s' failed: %s",
+                self.persist_directory, e,
+            )
+            raise VectorStoreQueryError(
+                f"Count query on store at '{self.persist_directory}' failed: {e}"
+            ) from e
+
         logger.info("Vector store contains %d documents", count)
         return count
 
@@ -452,14 +440,15 @@ class VectorStoreManager:
         """Return all document IDs stored in the collection.
 
         Raises:
-            VectorStoreLoadError: If the store cannot be loaded.
             VectorStoreQueryError: If the ID fetch fails.
         """
-        vectorstore = self._load_store()
         try:
-            result = vectorstore._collection.get(include=[])
+            result = self.chroma_client._collection.get(include=[])
         except Exception as e:
-            logger.error(f"Failed to retrieve document IDs from store at '{self.persist_directory}': {e}")
+            logger.error(
+                "Failed to retrieve document IDs from store at '%s': %s",
+                self.persist_directory, e,
+            )
             raise VectorStoreQueryError(
                 f"Failed to retrieve document IDs: {e}"
             ) from e
@@ -468,27 +457,17 @@ class VectorStoreManager:
         logger.info("Retrieved %d document IDs from store", len(ids))
         return ids
 
-    def safe_bulk_delete_all_vectors(
-        self, batch_size: int = DEFAULT_DELETE_BATCH_SIZE
-    ) -> None:
+    def safe_bulk_delete_all_vectors(self) -> None:
         """Delete ALL vectors from the collection in batches.
 
         Preserves the collection itself. Safe for large collections.
 
-        Args:
-            batch_size: Number of vectors to delete per batch.
+        Uses self.delete_batch_size to control batch sizing.
 
         Raises:
-            ValueError:            If batch_size is invalid.
-            VectorStoreLoadError:  If the store cannot be loaded.
             VectorStoreDeleteError: If deletion is incomplete.
         """
-        if batch_size < 1:
-            logger.error(f"batch_size must be >= 1, got {batch_size}.")
-            raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
-
-        vectorstore = self._load_store()
-        collection = vectorstore._collection
+        collection = self.chroma_client._collection
         total = collection.count()
 
         logger.info("Starting bulk delete of %d vectors", total)
@@ -500,13 +479,16 @@ class VectorStoreManager:
         deleted = 0
         while True:
             try:
-                result = collection.get(limit=batch_size, include=[])
+                result = collection.get(limit=self.delete_batch_size, include=[])
                 ids = result.get("ids", [])
                 if not ids:
                     break
                 collection.delete(ids=ids)
             except Exception as e:
-                logger.error(f"Batch delete failed after removing {deleted}/{total} vectors: {e}")
+                logger.error(
+                    "Batch delete failed after removing %d/%d vectors: %s",
+                    deleted, total, e,
+                )
                 raise VectorStoreDeleteError(
                     f"Batch delete failed after removing {deleted}/{total} "
                     f"vectors: {e}"
@@ -517,22 +499,27 @@ class VectorStoreManager:
 
         remaining = collection.count()
         if remaining != 0:
-            logger.error(f"Bulk delete incomplete: {remaining} vectors still remain after attempting to delete {total}.")
+            logger.error(
+                "Bulk delete incomplete: %d vectors still remain after "
+                "attempting to delete %d.",
+                remaining, total,
+            )
             raise VectorStoreDeleteError(
                 f"Bulk delete incomplete: {remaining} vectors still remain "
                 f"after attempting to delete {total}."
             )
 
-        logger.info("Bulk delete completed successfully — all %d vectors removed", total)
+        logger.info(
+            "Bulk delete completed successfully — all %d vectors removed", total
+        )
 
     # ------------------------------------------------------------------ #
     #  Helpers (private)                                                  #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _document_exists(vectorstore: Chroma, document_name: str) -> bool:
+    def _document_exists(self, document_name: str) -> bool:
         """Return True if any vector exists for the given document_name."""
-        collection = vectorstore._collection
+        collection = self.chroma_client._collection
         result = collection.get(
             where={"document_name": document_name},
             limit=1,
@@ -568,46 +555,6 @@ class VectorStoreManager:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _validate_init_args(
-        persist_directory: str,
-        embedding_model: str,
-        similarity_threshold: float,
-        duplicate_check_k: int,
-        embedding_max_retries: int,
-    ) -> None:
-        """Validate constructor arguments.
-
-        Raises:
-            ValueError: On any invalid argument.
-        """
-        if not persist_directory or not persist_directory.strip():
-            logger.error("persist_directory must be a non-empty string.")
-            raise ValueError("persist_directory must be a non-empty string.")
-        
-        if not embedding_model or not embedding_model.strip():
-            logger.error("embedding_model must be a non-empty string.")
-            raise ValueError("embedding_model must be a non-empty string.")
-
-        if not (0.0 < similarity_threshold <= 1.0):
-            logger.error(f"similarity_threshold must be between 0.0 and 1.0, got {similarity_threshold}.")
-            raise ValueError(
-                f"similarity_threshold must be between 0.0 and 1.0, "
-                f"got {similarity_threshold}."
-            )
-
-        if duplicate_check_k < 1:
-            logger.error(f"duplicate_check_k must be >= 1, got {duplicate_check_k}.")
-            raise ValueError(
-                f"duplicate_check_k must be >= 1, got {duplicate_check_k}."
-            )
-
-        if embedding_max_retries < 1:
-            logger.error(f"embedding_max_retries must be >= 1, got {embedding_max_retries}.")
-            raise ValueError(
-                f"embedding_max_retries must be >= 1, got {embedding_max_retries}."
-            )
-
-    @staticmethod
     def _validate_documents(documents: List[Document]) -> None:
         """Validate the documents list.
 
@@ -619,7 +566,9 @@ class VectorStoreManager:
             raise ValueError("documents must not be None.")
 
         if not isinstance(documents, list):
-            logger.error(f"documents must be a list, got {type(documents).__name__}.")
+            logger.error(
+                "documents must be a list, got %s.", type(documents).__name__
+            )
             raise ValueError(
                 f"documents must be a list, got {type(documents).__name__}."
             )
